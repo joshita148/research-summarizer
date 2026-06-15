@@ -122,6 +122,29 @@ Explanation Style: {style_input}
 )
 
 
+timeline_template = PromptTemplate(
+    template="""
+You are a research historian analyzing the paper "{paper_title}".
+
+Abstract: {abstract}
+
+Create a TL;DR timeline showing how this paper fits into the field's history:
+
+Just return the following and nothing else:
+1. **Before** (what came before this paper — 3 key papers/ideas that led to it)
+2. **This Paper** (what it introduced, year published)
+3. **After** (3 key papers/ideas it directly influenced or enabled)
+
+For each entry provide:
+- Year
+- Paper/concept name
+- One line why it matters in the chain
+
+Keep it concise and chronological. Style: {style_input}
+""",
+    input_variables=["paper_title", "abstract", "style_input"],
+)
+
 @st.cache_data(show_spinner=False)
 def fetch_paper_cached(paper_id: str):
     client = arxiv.Client()
@@ -167,7 +190,7 @@ def invoke_with_fallback(template, inputs: dict) -> str:
                 )
             
             # Show which model actually responded
-            st.caption(f"✅ Response from: {model_name}")
+            st.caption(f"Response from: {model_name}")
             return content
             
         except Exception as e:
@@ -204,6 +227,16 @@ def get_comparison(title1, abstract1, title2, abstract2, style_input):
         "style_input": style_input,
     })
 
+
+@st.cache_data(show_spinner=False)
+def get_timeline(paper_title, abstract, style_input):
+    return invoke_with_fallback(timeline_template, {
+        "paper_title": paper_title,
+        "abstract": abstract,
+        "style_input": style_input,
+    })
+
+
 def show_paper(paper_id: str):
     with st.spinner("Fetching paper..."):
         try:
@@ -218,22 +251,20 @@ def show_paper(paper_id: str):
     st.markdown(f"**ArXiv ID:** [{paper_id}](https://arxiv.org/abs/{paper_id})")
     st.divider()
 
-    # Run summary + citations concurrently
     summary_result = [None]
     citations_result = [None]
-    errors = []
 
     def run_summary():
         try:
             summary_result[0] = get_summary(paper['title'], paper['abstract'], style_input, length_input)
-        except Exception as e:
-            errors.append(f"Summary error: {e}")
+        except Exception:
+            pass
 
     def run_citations():
         try:
             citations_result[0] = get_citations(paper['title'], paper['abstract'])
-        except Exception as e:
-            errors.append(f"Citation error: {e}")
+        except Exception:
+            pass
 
     with st.spinner("Generating summary and extracting citations..."):
         t1 = threading.Thread(target=run_summary)
@@ -245,10 +276,8 @@ def show_paper(paper_id: str):
         st.write(summary_result[0])
     st.divider()
 
-    st.subheader(" Key Citations ")
-
+    st.subheader("Key Citations")
     if citations_result[0]:
-        # Fallback: search ArXiv by title for nulls
         for cite in citations_result[0]:
             if not cite.get("arxiv_id"):
                 found_id = search_arxiv_by_title(cite["title"])
@@ -268,9 +297,15 @@ def show_paper(paper_id: str):
                         st.rerun()
                 else:
                     st.caption("Not on ArXiv")
-    
-    if errors: 
-        st.warning("\n".join(errors))
+
+    st.divider()
+    st.subheader("Timeline - Where This Paper Stands")
+    with st.spinner("Building timeline..."):
+        try:
+            timeline = get_timeline(paper['title'], paper['abstract'], style_input)
+            st.markdown(timeline)
+        except Exception:
+            pass
 
 
 if mode == "Single Paper":
