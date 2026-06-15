@@ -28,12 +28,17 @@ if "paper_history" not in st.session_state:
 
 st.header("Research Tool")
 
+mode = st.radio("Mode", ["Single Paper", "Compare Papers"], horizontal=True)
 
 arxiv_input = st.text_input("Enter ArXiv URL or Paper ID", placeholder="e.g. https://arxiv.org/abs/1706.03762 or 1706.03762")
 
+if mode == "Compare Papers":
+    arxiv_input2 = st.text_input("Enter Second ArXiv URL or Paper ID", placeholder="e.g. 1706.03762")
+
 style_input = st.selectbox( "Select Explanation Style", ["Beginner-Friendly", "Technical", "Code-Oriented", "Mathematical"] ) 
 
-length_input = st.selectbox( "Select Explanation Length", ["Short (1-2 paragraphs)", "Medium (3-5 paragraphs)", "Long (detailed explanation)"] )
+if mode == "Single Paper":
+    length_input = st.selectbox("Select Explanation Length", ["Short (1-2 paragraphs)", "Medium (3-5 paragraphs)", "Long (detailed explanation)"])
 
 def extract_arxiv_id(raw: str) -> str:
     """Pulls the paper ID out of a URL or returns as-is."""
@@ -95,6 +100,28 @@ Use null for arxiv_id if the paper is not on ArXiv (e.g. older books, non-CS pap
 )
 
 
+compare_template = PromptTemplate(
+    template="""
+You are comparing two research papers.
+
+Paper 1: "{title1}"
+Abstract 1: {abstract1}
+
+Paper 2: "{title2}"
+Abstract 2: {abstract2}
+
+Provide a structured comparison with:
+1. **Core Contributions** — what each paper uniquely contributes
+2. **Where They Agree** — shared ideas, assumptions, or findings
+3. **Where They Conflict** — contradictions or opposing approaches
+4. **Which to Read First** — and why
+
+Explanation Style: {style_input}
+""",
+    input_variables=["title1", "abstract1", "title2", "abstract2", "style_input"],
+)
+
+
 @st.cache_data(show_spinner=False)
 def fetch_paper_cached(paper_id: str):
     client = arxiv.Client()
@@ -144,7 +171,6 @@ def invoke_with_fallback(template, inputs: dict) -> str:
             return content
             
         except Exception as e:
-            st.warning(f"⚠️ {model_name} failed: {e} — trying next...")
             last_error = e
             continue
     
@@ -167,6 +193,16 @@ def get_citations(paper_title, abstract):
     })
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
+
+@st.cache_data(show_spinner=False)
+def get_comparison(title1, abstract1, title2, abstract2, style_input):
+    return invoke_with_fallback(compare_template, {
+        "title1": title1,
+        "abstract1": abstract1,
+        "title2": title2,
+        "abstract2": abstract2,
+        "style_input": style_input,
+    })
 
 def show_paper(paper_id: str):
     with st.spinner("Fetching paper..."):
@@ -237,21 +273,53 @@ def show_paper(paper_id: str):
         st.warning("\n".join(errors))
 
 
-# --- Breadcrumb trail ---
-if st.session_state.paper_history:
-    st.markdown("**Your trail:** " + " → ".join(st.session_state.paper_history))
-    if st.button("⬅ Go Back"):
-        prev = st.session_state.paper_history.pop()
-        st.session_state.current_paper_id = prev
-        st.rerun()
-    st.divider()
+if mode == "Single Paper":
+    # --- Breadcrumb trail ---
+    if st.session_state.paper_history:
+        st.markdown("**Your trail:** " + " → ".join(st.session_state.paper_history))
+        if st.button("⬅ Go Back"):
+            prev = st.session_state.paper_history.pop()
+            st.session_state.current_paper_id = prev
+            st.rerun()
+        st.divider()
 
-# --- Main trigger ---
-if st.button("Summarize"):
-    paper_id = extract_arxiv_id(arxiv_input)
-    st.session_state.current_paper_id = paper_id
-    st.session_state.paper_history = []
-    show_paper(paper_id)
+    if st.button("Summarize"):
+        paper_id = extract_arxiv_id(arxiv_input)
+        st.session_state.current_paper_id = paper_id
+        st.session_state.paper_history = []
+        show_paper(paper_id)
+    elif st.session_state.current_paper_id:
+        show_paper(st.session_state.current_paper_id)
 
-elif st.session_state.current_paper_id:
-    show_paper(st.session_state.current_paper_id)
+elif mode == "Compare Papers":
+    if st.button("Compare"):
+        id1 = extract_arxiv_id(arxiv_input)
+        id2 = extract_arxiv_id(arxiv_input2)
+
+        with st.spinner("Fetching both papers..."):
+            try:
+                paper1 = fetch_paper_cached(id1)
+                paper2 = fetch_paper_cached(id2)
+            except Exception as e:
+                st.error(f"Fetch failed: {e}")
+                st.stop()
+
+        # Side by side metadata
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"### {paper1['title']}")
+            st.caption(f"{paper1['published']} · {', '.join(paper1['authors'][:3])}")
+        with col2:
+            st.markdown(f"### {paper2['title']}")
+            st.caption(f"{paper2['published']} · {', '.join(paper2['authors'][:3])}")
+
+        st.divider()
+
+        with st.spinner("Comparing papers..."):
+            comparison = get_comparison(
+                paper1['title'], paper1['abstract'],
+                paper2['title'], paper2['abstract'],
+                style_input
+            )
+
+        st.markdown(comparison)
