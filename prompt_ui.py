@@ -1,4 +1,6 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEndpoint
 from dotenv import load_dotenv
 import streamlit as st
 from langchain_core.prompts import PromptTemplate
@@ -7,7 +9,16 @@ import json
 import threading
 
 load_dotenv()
-model = ChatGoogleGenerativeAI(model = "gemini-2.5-flash")
+#model = ChatGoogleGenerativeAI(model = "gemini-2.5-flash")
+
+def get_models_in_order():
+    models = []
+
+    models.append(("Gemini 2.5 Flash", ChatGoogleGenerativeAI(model="gemini-2.5-flash")))
+    models.append(("Groq LLaMA 3.3", ChatGroq(model="llama-3.3-70b-versatile")))
+    models.append(("HuggingFace Mistral", HuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3", task="text-generation", max_new_tokens=1024,)))
+    return models
+
 
 # --- Session State ---
 if "current_paper_id" not in st.session_state:
@@ -60,9 +71,7 @@ Explanation Length: {length_input}
 If certain information is not available, respond with "Insufficient information available" instead of guessing.
 Ensure the summary is clear, accurate, and aligned with the provided style and length.
 """,
-input_variables=["paper_title", "abstract", "style_input", "length_input"],
-validate_template=True
-)
+input_variables=["paper_title", "abstract", "style_input", "length_input"])
 
 
 citation_template = PromptTemplate(
@@ -109,25 +118,54 @@ def search_arxiv_by_title(title: str):
         return r.entry_id.split("/abs/")[-1].split("v")[0]
     return None
 
+
+MODELS = get_models_in_order()
+
+def invoke_with_fallback(template, inputs: dict) -> str:
+    """Try each model in order, fall back if invoke fails."""
+    last_error = None
+    
+    for model_name, model in MODELS:
+        try:
+            chain = template | model
+            result = chain.invoke(inputs)
+            
+            # Handle content parsing
+            content = result.content
+            if isinstance(content, list):
+                content = " ".join(
+                    block["text"] if isinstance(block, dict) else str(block)
+                    for block in content
+                    if not isinstance(block, dict) or block.get("type") == "text"
+                )
+            
+            # Show which model actually responded
+            st.caption(f"✅ Response from: {model_name}")
+            return content
+            
+        except Exception as e:
+            st.warning(f"⚠️ {model_name} failed: {e} — trying next...")
+            last_error = e
+            continue
+    
+    raise RuntimeError(f" All models failed. Last error: {last_error}")
+
 @st.cache_data(show_spinner=False)
 def get_summary(paper_title, abstract, style_input, length_input):
-    chain = summary_template | model
-    result = chain.invoke({
+    return invoke_with_fallback(summary_template, {
         "paper_title": paper_title,
         "abstract": abstract,
         "style_input": style_input,
         "length_input": length_input,
     })
-    return result.content
 
 @st.cache_data(show_spinner=False)
 def get_citations(paper_title, abstract):
-    cite_chain = citation_template | model
-    result = cite_chain.invoke({
+    raw = invoke_with_fallback(citation_template, {
         "paper_title": paper_title,
         "abstract": abstract,
     })
-    raw = result.content.strip().replace("```json", "").replace("```", "")
+    raw = raw.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def show_paper(paper_id: str):
@@ -181,22 +219,23 @@ def show_paper(paper_id: str):
                 if found_id:
                     cite["arxiv_id"] = found_id
 
-        for cite in citations_result[0]:
+        for i, cite in enumerate(citations_result[0]):
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.markdown(f"**{cite['title']}**")
                 st.caption(cite.get("reason", ""))
             with col2:
                 if cite.get("arxiv_id"):
-                    if st.button("Fetch →", key=f"cite_{cite['arxiv_id']}"):
+                    if st.button("Fetch →", key=f"cite_{i}_{cite['arxiv_id']}"):
                         st.session_state.paper_history.append(paper_id)
                         st.session_state.current_paper_id = cite["arxiv_id"]
                         st.rerun()
                 else:
                     st.caption("Not on ArXiv")
     
-    if errors:
+    if errors: 
         st.warning("\n".join(errors))
+
 
 # --- Breadcrumb trail ---
 if st.session_state.paper_history:
