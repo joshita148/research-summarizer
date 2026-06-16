@@ -11,6 +11,15 @@ import threading
 load_dotenv()
 #model = ChatGoogleGenerativeAI(model = "gemini-2.5-flash")
 
+
+# --- Session State ---
+if "arxiv_input_val" not in st.session_state:
+    st.session_state.arxiv_input_val = ""
+if "current_paper_id" not in st.session_state:
+    st.session_state.current_paper_id = ""
+if "paper_history" not in st.session_state:
+    st.session_state.paper_history = []
+
 def get_models_in_order():
     models = []
 
@@ -20,17 +29,12 @@ def get_models_in_order():
     return models
 
 
-# --- Session State ---
-if "current_paper_id" not in st.session_state:
-    st.session_state.current_paper_id = ""
-if "paper_history" not in st.session_state:
-    st.session_state.paper_history = []
-
 st.header("Research Tool")
 
 mode = st.radio("Mode", ["Single Paper", "Compare Papers"], horizontal=True)
 
-arxiv_input = st.text_input("Enter ArXiv URL or Paper ID", placeholder="e.g. https://arxiv.org/abs/1706.03762 or 1706.03762")
+arxiv_input = st.text_input("Enter ArXiv URL or Paper ID", placeholder="e.g. https://arxiv.org/abs/1706.03762 or 1706.03762", value=st.session_state.arxiv_input_val)
+
 
 if mode == "Compare Papers":
     arxiv_input2 = st.text_input("Enter Second ArXiv URL or Paper ID", placeholder="e.g. 1706.03762")
@@ -81,20 +85,21 @@ input_variables=["paper_title", "abstract", "style_input", "length_input"])
 
 citation_template = PromptTemplate(
     template="""
-Based on the research paper "{paper_title}" with this abstract:
+Extract the 5 most important references actually cited in this research paper.
 
-{abstract}
+Paper Title: "{paper_title}"
+Paper Text: {abstract}
 
-List the 5 most important papers that this work builds upon or cites.
-For each, provide the paper title and its ArXiv ID if it exists on ArXiv.
+Look for a References or Bibliography section at the end of the text.
+Extract ONLY citations that appear in the text — do not invent or suggest any.
 
 Respond ONLY with a valid JSON array, no markdown, no backticks, no explanation:
 [
-  {{"title": "Paper Title Here", "arxiv_id": "1234.56789", "reason": "one line why it matters"}},
-  {{"title": "Paper Title Here", "arxiv_id": null, "reason": "one line why it matters"}}
+  {{"title": "Exact Paper Title", "arxiv_id": "1234.56789", "reason": "one line why it matters to this paper"}},
+  {{"title": "Exact Paper Title", "arxiv_id": null, "reason": "one line why it matters to this paper"}}
 ]
 
-Use null for arxiv_id if the paper is not on ArXiv (e.g. older books, non-CS papers).
+Use null for arxiv_id if not an ArXiv paper.
 """,
     input_variables=["paper_title", "abstract"],
 )
@@ -124,26 +129,45 @@ Explanation Style: {style_input}
 
 timeline_template = PromptTemplate(
     template="""
-You are a research historian analyzing the paper "{paper_title}".
+You are a research historian. Analyze this paper:
 
+Title: "{paper_title}"
+Published: {published}
 Abstract: {abstract}
 
-Create a TL;DR timeline showing how this paper fits into the field's history:
+Create a timeline of how this paper fits into its field.
 
-Just return the following and nothing else:
-1. **Before** (what came before this paper — 3 key papers/ideas that led to it)
-2. **This Paper** (what it introduced, year published)
-3. **After** (3 key papers/ideas it directly influenced or enabled)
+Rules:
+- Only include REAL papers you are confident exist
+- Use the exact publication year provided above for "This Paper"
+- For "Before": 3 real foundational papers that led to this work, with correct years
+- For "After": 3 real papers published after {published} that this work influenced. Only use "Too recent to assess influence yet" if the paper was published in the in the current year. For older papers, you must find real follow-up work — do NOT invent papers, but do NOT give up early either.
+- Never guess or hallucinate paper titles or years
 
-For each entry provide:
-- Year
-- Paper/concept name
-- One line why it matters in the chain
+Format:
+**Before**
+- YEAR — Paper Name — why it matters
 
-Keep it concise and chronological. Style: {style_input}
+**This Paper**
+- YEAR — {paper_title} — what it introduced
+
+**After**
+- YEAR — Paper Name — why it matters
+(or "Too recent to assess influence yet.")
+
+Style: {style_input}
 """,
-    input_variables=["paper_title", "abstract", "style_input"],
+    input_variables=["paper_title", "abstract", "published", "style_input"]
 )
+
+@st.cache_data(show_spinner=False)
+def get_timeline(paper_title, abstract, published, style_input):
+    return invoke_with_fallback(timeline_template, {
+        "paper_title": paper_title,
+        "abstract": abstract,
+        "published": published,
+        "style_input": style_input,
+    })
 
 @st.cache_data(show_spinner=False)
 def fetch_paper_cached(paper_id: str):
@@ -156,6 +180,28 @@ def fetch_paper_cached(paper_id: str):
         "published": paper.published.strftime("%B %Y"),
         "abstract": paper.summary,
     }
+
+@st.cache_data(show_spinner=False)
+def fetch_full_text(paper_id: str) -> str:
+    import urllib.request
+    import fitz  # pymupdf
+    import tempfile
+    import os
+
+    pdf_url = f"https://arxiv.org/pdf/{paper_id}"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        urllib.request.urlretrieve(pdf_url, f.name)
+        tmp_path = f.name
+
+    doc = fitz.open(tmp_path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    doc.close()
+    os.unlink(tmp_path)
+
+    # Return first 8000 chars — enough for references + body
+    return text[:8000]
 
 @st.cache_data(show_spinner=False)
 def search_arxiv_by_title(title: str):
@@ -217,6 +263,99 @@ def get_citations(paper_title, abstract):
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
+
+def export_as_markdown(paper, summary, citations, timeline, paper_id):
+    authors = ', '.join(paper['authors'][:5])
+    
+    citations_md = ""
+    if citations:
+        for cite in citations:
+            link = f"https://arxiv.org/abs/{cite['arxiv_id']}" if cite.get('arxiv_id') else "Not on ArXiv"
+            citations_md += f"- **{cite['title']}** — {cite.get('reason', '')} [{link}]\n"
+
+    md = f"""# {paper['title']}
+
+**Authors:** {authors}  
+**Published:** {paper['published']}  
+**ArXiv:** https://arxiv.org/abs/{paper_id}
+
+---
+
+## Summary
+{summary}
+
+---
+
+## Key Citations
+{citations_md}
+
+---
+
+## Timeline
+{timeline}
+"""
+    return md
+
+
+def export_as_pdf(paper, summary, citations, timeline, paper_id):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.enums import TA_LEFT
+    import io
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            leftMargin=20*mm, rightMargin=20*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("title", fontSize=15, fontName="Helvetica-Bold", spaceAfter=6)
+    heading_style = ParagraphStyle("heading", fontSize=12, fontName="Helvetica-Bold", spaceAfter=4, spaceBefore=10)
+    body_style = ParagraphStyle("body", fontSize=10, fontName="Helvetica", spaceAfter=3, leading=14)
+
+    def clean(text):
+        if not text:
+            return ""
+        return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("**", "").replace("#", "")
+
+    story = []
+
+    # Title + metadata
+    story.append(Paragraph(clean(paper['title']), title_style))
+    story.append(Paragraph(f"Authors: {clean(', '.join(paper['authors'][:5]))}", body_style))
+    story.append(Paragraph(f"Published: {clean(str(paper['published']))}", body_style))
+    story.append(Paragraph(f"ArXiv: https://arxiv.org/abs/{paper_id}", body_style))
+    story.append(Spacer(1, 6*mm))
+
+    # Summary
+    story.append(Paragraph("Summary", heading_style))
+    for line in clean(summary).split("\n"):
+        if line.strip():
+            story.append(Paragraph(line, body_style))
+    story.append(Spacer(1, 4*mm))
+
+    # Citations
+    if citations:
+        story.append(Paragraph("Key Citations", heading_style))
+        for cite in citations:
+            line = f"- {cite['title']} — {cite.get('reason', '')}"
+            if cite.get('arxiv_id'):
+                line += f" [arxiv.org/abs/{cite['arxiv_id']}]"
+            story.append(Paragraph(clean(line), body_style))
+        story.append(Spacer(1, 4*mm))
+
+    # Timeline
+    if timeline:
+        story.append(Paragraph("Timeline", heading_style))
+        for line in clean(timeline).split("\n"):
+            if line.strip():
+                story.append(Paragraph(line, body_style))
+
+    doc.build(story)
+    return buffer.getvalue()
+
 @st.cache_data(show_spinner=False)
 def get_comparison(title1, abstract1, title2, abstract2, style_input):
     return invoke_with_fallback(compare_template, {
@@ -226,16 +365,6 @@ def get_comparison(title1, abstract1, title2, abstract2, style_input):
         "abstract2": abstract2,
         "style_input": style_input,
     })
-
-
-@st.cache_data(show_spinner=False)
-def get_timeline(paper_title, abstract, style_input):
-    return invoke_with_fallback(timeline_template, {
-        "paper_title": paper_title,
-        "abstract": abstract,
-        "style_input": style_input,
-    })
-
 
 def show_paper(paper_id: str):
     with st.spinner("Fetching paper..."):
@@ -249,20 +378,41 @@ def show_paper(paper_id: str):
     st.markdown(f"**Authors:** {', '.join(paper['authors'][:5])}{'...' if len(paper['authors']) > 5 else ''}")
     st.markdown(f"**Published:** {paper['published']}")
     st.markdown(f"**ArXiv ID:** [{paper_id}](https://arxiv.org/abs/{paper_id})")
+
+    # APA Citation
+    authors = paper['authors']
+    if len(authors) == 1:
+        author_str = authors[0]
+    elif len(authors) <= 5:
+        author_str = ", ".join(authors[:-1]) + f", & {authors[-1]}"
+    else:
+        author_str = ", ".join(authors[:5]) + ", et al."
+
+    year = paper['published'].split(" ")[-1]
+    apa = f"{author_str}. ({year}). {paper['title']}. *arXiv*. https://doi.org/10.48550/arXiv.{paper_id}"
+    st.markdown("**APA Citation**")
+    st.code(apa, language=None)
+
     st.divider()
+
+    with st.spinner("Fetching full paper text..."):
+        try:
+            full_text = fetch_full_text(paper_id)
+        except Exception:
+            full_text = paper['abstract']  # fallback to abstract
 
     summary_result = [None]
     citations_result = [None]
 
     def run_summary():
         try:
-            summary_result[0] = get_summary(paper['title'], paper['abstract'], style_input, length_input)
+            summary_result[0] = get_summary(paper['title'], full_text, style_input, length_input)
         except Exception:
             pass
 
     def run_citations():
         try:
-            citations_result[0] = get_citations(paper['title'], paper['abstract'])
+            citations_result[0] = get_citations(paper['title'], full_text)
         except Exception:
             pass
 
@@ -274,6 +424,7 @@ def show_paper(paper_id: str):
 
     if summary_result[0]:
         st.write(summary_result[0])
+        st.session_state.last_summary = summary_result[0]  # store for export
     st.divider()
 
     st.subheader("Key Citations")
@@ -287,13 +438,15 @@ def show_paper(paper_id: str):
         for i, cite in enumerate(citations_result[0]):
             col1, col2 = st.columns([3, 1])
             with col1:
-                st.markdown(f"**{cite['title']}**")
+                if cite.get("arxiv_id"):
+                    st.markdown(f"**[{cite['title']}](https://arxiv.org/abs/{cite['arxiv_id']})**")
+                else:
+                    st.markdown(f"**{cite['title']}**")
                 st.caption(cite.get("reason", ""))
             with col2:
                 if cite.get("arxiv_id"):
-                    if st.button("Fetch →", key=f"cite_{i}_{cite['arxiv_id']}"):
-                        st.session_state.paper_history.append(paper_id)
-                        st.session_state.current_paper_id = cite["arxiv_id"]
+                    if st.button("Dive In →", key=f"cite_{i}_{cite['arxiv_id']}"):
+                        st.session_state.arxiv_input_val = cite["arxiv_id"]
                         st.rerun()
                 else:
                     st.caption("Not on ArXiv")
@@ -302,28 +455,44 @@ def show_paper(paper_id: str):
     st.subheader("Timeline - Where This Paper Stands")
     with st.spinner("Building timeline..."):
         try:
-            timeline = get_timeline(paper['title'], paper['abstract'], style_input)
+            timeline = get_timeline(paper['title'], full_text, paper['published'], style_input)
             st.markdown(timeline)
-        except Exception:
-            pass
+        except Exception as err:
+            st.error(f"Timeline error: {err}")
+
+    if summary_result[0]:
+        md = export_as_markdown(paper, summary_result[0], citations_result[0], timeline or "", paper_id)
+        pdf = export_as_pdf(paper, summary_result[0], citations_result[0], timeline or "", paper_id)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Download Markdown",
+                data=md,
+                file_name=f"{paper_id}_report.md",
+                mime="text/markdown"
+            )
+        with col2:
+            st.download_button(
+                "Download PDF",
+                data=pdf,
+                file_name=f"{paper_id}_report.pdf",
+                mime="application/pdf"
+            )
+
 
 
 if mode == "Single Paper":
-    # --- Breadcrumb trail ---
-    if st.session_state.paper_history:
-        st.markdown("**Your trail:** " + " → ".join(st.session_state.paper_history))
-        if st.button("⬅ Go Back"):
-            prev = st.session_state.paper_history.pop()
-            st.session_state.current_paper_id = prev
-            st.rerun()
-        st.divider()
+    if extract_arxiv_id(arxiv_input) != st.session_state.current_paper_id:
+        st.session_state.current_paper_id = ""
 
     if st.button("Summarize"):
         paper_id = extract_arxiv_id(arxiv_input)
         st.session_state.current_paper_id = paper_id
         st.session_state.paper_history = []
-        show_paper(paper_id)
-    elif st.session_state.current_paper_id:
+        st.rerun()
+
+    if st.session_state.current_paper_id:
         show_paper(st.session_state.current_paper_id)
 
 elif mode == "Compare Papers":
