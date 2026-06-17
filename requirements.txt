@@ -17,3 +17,10 @@ python-dotenv
 # Machine Learning Utilities
 numpy
 scikit-learn
+arxiv
+google-genai google-adk==1.22.1
+reportlab
+fpdf2
+pymupdf
+langchain-groq
+langchain-huggingface
