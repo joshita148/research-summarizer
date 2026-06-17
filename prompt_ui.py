@@ -7,6 +7,7 @@ from langchain_core.prompts import PromptTemplate
 import arxiv
 import json
 import threading
+import os
 
 load_dotenv()
 #model = ChatGoogleGenerativeAI(model = "gemini-2.5-flash")
@@ -19,6 +20,12 @@ if "current_paper_id" not in st.session_state:
     st.session_state.current_paper_id = ""
 if "paper_history" not in st.session_state:
     st.session_state.paper_history = []
+if "comparison_result" not in st.session_state:
+    st.session_state.comparison_result = None
+if "podcast_script" not in st.session_state:
+    st.session_state.podcast_script = ""
+if "podcast_paper_id" not in st.session_state:
+    st.session_state.podcast_paper_id = ""
 
 def get_models_in_order():
     models = []
@@ -31,7 +38,7 @@ def get_models_in_order():
 
 st.header("Research Tool")
 
-mode = st.radio("Mode", ["Single Paper", "Compare Papers"], horizontal=True)
+mode = st.radio("Mode", ["Single Paper", "Compare Papers", "Podcast"], horizontal=True)
 
 arxiv_input = st.text_input("Enter ArXiv URL or Paper ID", placeholder="e.g. https://arxiv.org/abs/1706.03762 or 1706.03762", value=st.session_state.arxiv_input_val)
 
@@ -39,7 +46,10 @@ arxiv_input = st.text_input("Enter ArXiv URL or Paper ID", placeholder="e.g. htt
 if mode == "Compare Papers":
     arxiv_input2 = st.text_input("Enter Second ArXiv URL or Paper ID", placeholder="e.g. 1706.03762")
 
-style_input = st.selectbox( "Select Explanation Style", ["Beginner-Friendly", "Technical", "Code-Oriented", "Mathematical"] ) 
+if mode != "Podcast":
+    style_input = st.selectbox("Select Explanation Style", ["Beginner-Friendly", "Technical", "Code-Oriented", "Mathematical"])
+else:
+    style_input = "Beginner-Friendly"  # default, not shown
 
 if mode == "Single Paper":
     length_input = st.selectbox("Select Explanation Length", ["Short (1-2 paragraphs)", "Medium (3-5 paragraphs)", "Long (detailed explanation)"])
@@ -159,6 +169,80 @@ Style: {style_input}
 """,
     input_variables=["paper_title", "abstract", "published", "style_input"]
 )
+
+podcast_template = PromptTemplate(
+    template="""
+You are writing a podcast script between two hosts: Joe and Jane.
+They are discussing the research paper "{paper_title}" in a fun, engaging, accessible way.
+
+Abstract:
+{abstract}
+
+Rules:
+- Start with Joe introducing the paper and why it matters
+- Alternate between Joe and Jane naturally
+- Cover: what problem it solves, key ideas, interesting findings, real world impact
+- End with Jane giving a key takeaway for listeners
+- Format each line as: "Joe: ..." or "Jane: ..."
+- Keep it conversational, not academic
+- Total length: about 20-30 exchanges
+""",
+    input_variables=["paper_title", "abstract"]
+)
+
+@st.cache_data(show_spinner=False)
+def get_podcast_script(paper_title: str, abstract: str) -> str:
+    return invoke_with_fallback(podcast_template, {
+        "paper_title": paper_title,
+        "abstract": abstract,
+    })
+
+
+def generate_podcast_audio(script: str) -> bytes:
+    import wave
+    import io
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    prompt = f"TTS the following conversation between Joe and Jane:\n\n{script}"
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-preview-tts",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
+                    speaker_voice_configs=[
+                        types.SpeakerVoiceConfig(
+                            speaker="Joe",
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+                            )
+                        ),
+                        types.SpeakerVoiceConfig(
+                            speaker="Jane",
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+                            )
+                        )
+                    ]
+                )
+            )
+        )
+    )
+
+    audio_data = response.candidates[0].content.parts[0].inline_data.data
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(audio_data)
+    return buffer.getvalue()
+
 
 @st.cache_data(show_spinner=False)
 def get_timeline(paper_title, abstract, published, style_input):
@@ -508,7 +592,22 @@ elif mode == "Compare Papers":
                 st.error(f"Fetch failed: {e}")
                 st.stop()
 
-        # Side by side metadata
+        with st.spinner("Comparing papers..."):
+            comparison = get_comparison(
+                paper1['title'], paper1['abstract'],
+                paper2['title'], paper2['abstract'],
+                style_input
+            )
+
+        st.session_state.comparison_result = comparison
+        st.session_state.comparison_paper1 = paper1
+        st.session_state.comparison_paper2 = paper2
+        st.rerun()
+
+    if st.session_state.comparison_result:
+        paper1 = st.session_state.comparison_paper1
+        paper2 = st.session_state.comparison_paper2
+
         col1, col2 = st.columns(2)
         with col1:
             st.markdown(f"### {paper1['title']}")
@@ -518,12 +617,75 @@ elif mode == "Compare Papers":
             st.caption(f"{paper2['published']} · {', '.join(paper2['authors'][:3])}")
 
         st.divider()
+        st.markdown(st.session_state.comparison_result)
+        st.divider()
 
-        with st.spinner("Comparing papers..."):
-            comparison = get_comparison(
-                paper1['title'], paper1['abstract'],
-                paper2['title'], paper2['abstract'],
-                style_input
-            )
+        st.subheader("🎙️ Generate Podcast")
+        if st.button("Generate Podcast Script + Audio"):
+            papers_text = f"""
+---
+Title: {paper1['title']}
+Summary: {paper1['abstract']}
 
-        st.markdown(comparison)
+---
+Title: {paper2['title']}
+Summary: {paper2['abstract']}
+"""
+            with st.spinner("Writing podcast script..."):
+                script = get_podcast_script(papers_text)
+            st.session_state.podcast_script = script
+            st.rerun()
+
+        if st.session_state.get("podcast_script"):
+            st.subheader("Script")
+            st.markdown(st.session_state.podcast_script)
+
+            if st.button("Generate Audio"):
+                with st.spinner("Generating audio... 2-3 minutes..."):
+                    try:
+                        audio_bytes = generate_podcast_audio(st.session_state.podcast_script)
+                        st.audio(audio_bytes, format="audio/wav")
+                        st.download_button(
+                            "Download Podcast",
+                            data=audio_bytes,
+                            file_name="podcast.wav",
+                            mime="audio/wav"
+                        )
+                    except Exception as e:
+                        st.error(f"Audio failed: {e}")
+
+elif mode == "Podcast":
+    if st.button("Generate Podcast"):
+        paper_id = extract_arxiv_id(arxiv_input)
+
+        with st.spinner("Fetching paper..."):
+            try:
+                paper = fetch_paper_cached(paper_id)
+            except Exception as e:
+                st.error(f"Fetch failed: {e}")
+                st.stop()
+
+        st.markdown(f"### {paper['title']}")
+        st.caption(f"{paper['published']} · {', '.join(paper['authors'][:3])}")
+        st.divider()
+
+        papers_text = f"""
+---
+Title: {paper['title']}
+Abstract: {paper['abstract']}
+"""
+        with st.spinner("Writing podcast script..."):
+                script = get_podcast_script(paper['title'], paper['abstract'])
+        
+        with st.spinner("Generating audio... 2-3 minutes..."):
+            try:
+                audio_bytes = generate_podcast_audio(script)
+                st.audio(audio_bytes, format="audio/wav")
+                st.download_button(
+                    "⬇️ Download Podcast",
+                    data=audio_bytes,
+                    file_name="podcast.wav",
+                    mime="audio/wav"
+                )
+            except Exception as e:
+                st.error(f"Audio failed: {e}")
